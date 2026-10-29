@@ -1,0 +1,267 @@
+--- a/src/Bot/Factory/PlayerbotFactory.cpp
++++ b/src/Bot/Factory/PlayerbotFactory.cpp
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "PlayerbotFactory.h"
++#include "RandomBotGearCap.h"
+ #include "AccountMgr.h"
+ #include "AiFactory.h"
+ #include "AiObjectContext.h"
+@@ -2725,6 +2726,7 @@
+ 
+ void PlayerbotFactory::InitEquipment(bool incremental, bool second_chance, int32 onlySlot)
+ {
++    uint32 const randomBotItemLevelCap = Playerbots::RandomBotItemLevelCap(bot);
+     // A Wildcard Hero has no class starting outfit (the core's Wildcard kit goes to players at their first login):
+     // it takes its gear from the regular search below at any level, else it stayed naked under level 5.
+     if (level < 5 && !IsWildcardHeroBot(bot))
+@@ -2801,6 +2803,7 @@
+             // Respect gear quality limit: trinket must not exceed itemQuality setting
+             if (static_cast<int32>(proto->Quality) > static_cast<int32>(itemQuality)) continue;
+             if (proto->RequiredLevel > level) continue;
++            if (randomBotItemLevelCap && proto->ItemLevel > randomBotItemLevelCap) continue;
+             if (!CanEquipItem(proto)) continue;
+             uint16 dest;
+             if (!CanEquipUnseenItem(EQUIPMENT_SLOT_TRINKET1, dest, itemId)) continue;
+@@ -2911,6 +2914,9 @@
+                         if (proto->Class != ITEM_CLASS_WEAPON && proto->Class != ITEM_CLASS_ARMOR)
+                             continue;
+ 
++                        if (randomBotItemLevelCap && proto->ItemLevel > randomBotItemLevelCap)
++                            continue;
++
+                         if (maxItemLevel && proto->ItemLevel > maxItemLevel)
+                             continue;
+ 
+@@ -3003,7 +3009,9 @@
+         bool const oldNoWeapon = oldItem && (IsAscensionCustomClassId(bot->getClass()) || IsWildcardHeroBot(bot)) &&
+                                  oldItem->GetTemplate()->Class == ITEM_CLASS_WEAPON &&
+                                  !CanEquipWeapon(oldItem->GetTemplate());
+-        if (incremental && oldItem && !oldCannotShoot && !oldNoWeapon)
++        bool const oldExceedsItemLevelCap = oldItem && randomBotItemLevelCap &&
++            oldItem->GetTemplate()->ItemLevel > randomBotItemLevelCap;
++        if (incremental && oldItem && !oldCannotShoot && !oldNoWeapon && !oldExceedsItemLevelCap)
+         {
+             // CoA: an equipped heirloom stays; it scales with the bot and a worldforged piece scoring a bit
+             // higher at this level would leave it in the bags.
+@@ -5409,6 +5417,7 @@
+ 
+ void PlayerbotFactory::InitInventoryEquip()
+ {
++    uint32 const equipmentCap = Playerbots::RandomBotItemLevelCap(bot);
+     std::vector<uint32> ids;
+ 
+     uint32 desiredQuality = itemQuality;
+@@ -5432,6 +5441,9 @@
+             continue;
+ 
+         if (proto->Class == ITEM_CLASS_WEAPON && !CanEquipWeapon(proto))
++            continue;
++
++        if (equipmentCap && proto->ItemLevel > equipmentCap)
+             continue;
+ 
+         if (proto->Quality != desiredQuality)
+--- a/src/Bot/RandomPlayerbotMgr.cpp
++++ b/src/Bot/RandomPlayerbotMgr.cpp
+@@ -40,6 +40,7 @@
+ #include "RaceMgr.h"
+ #include "Random.h"
+ #include "RandomBotLevelMgr.h"
++#include "RandomBotGearCap.h"
+ #include "RandomPlayerbotFactory.h"
+ #include "ServerFacade.h"
+ #include "SharedDefines.h"
+@@ -3454,8 +3455,19 @@
+         itemLevel = tiers[tier].second;
+     }
+ 
++    uint32 const itemLevelCap = Playerbots::RandomBotItemLevelCap(bot);
++    if (itemLevelCap && itemLevel > itemLevelCap)
++        itemLevel = itemLevelCap;
++    bool equipmentExceedsCap = false;
++    if (itemLevelCap)
++        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
++            if (slot != EQUIPMENT_SLOT_BODY && slot != EQUIPMENT_SLOT_TABARD)
++                if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
++                    equipmentExceedsCap = equipmentExceedsCap || item->GetTemplate()->ItemLevel > itemLevelCap;
++
+     uint32 const botId = bot->GetGUID().GetCounter();
+-    if (GetValue(botId, "coaGearPvp") == uint32(pvp) && GetValue(botId, "coaGearScore") == itemLevel)
++    if (!equipmentExceedsCap && GetValue(botId, "coaGearPvp") == uint32(pvp) &&
++        GetValue(botId, "coaGearScore") == itemLevel)
+         return;
+ 
+     // A bot on its own keeps its PvP gear for 10 minutes out of a battleground and its queue: most queue again at
+@@ -3596,6 +3608,27 @@
+             factory.InitEquipment(false, false);
+             factory.InitAmmo();
+             LOG_INFO("playerbots", "coa repair: {} wore gear above level {}: geared again", bot->GetName(), bot->GetLevel());
++        }
++    }
++
++    uint32 const equipmentCap = Playerbots::RandomBotItemLevelCap(bot);
++    if (equipmentCap)
++    {
++        bool invalidEquipment = false;
++        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
++            if (slot != EQUIPMENT_SLOT_BODY && slot != EQUIPMENT_SLOT_TABARD)
++                if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
++                    invalidEquipment = invalidEquipment || item->GetTemplate()->ItemLevel > equipmentCap ||
++                        item->GetTemplate()->RequiredLevel > bot->GetLevel();
++        if (invalidEquipment)
++        {
++            PlayerbotFactory::DestroyEquippedGear(bot);
++            PlayerbotFactory factory(bot, bot->GetLevel());
++            factory.InitEquipment(false, false);
++            factory.InitAmmo();
++            if (bot->GetLevel() >= sPlayerbotAIConfig.minEnchantingBotLevel)
++                factory.ApplyEnchantAndGemsNew();
++            bot->SaveToDB(false, false);
+         }
+     }
+ 
+--- a/src/Ai/Base/Actions/EquipAction.cpp
++++ b/src/Ai/Base/Actions/EquipAction.cpp
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "EquipAction.h"
++#include "RandomBotGearCap.h"
+ #include "Event.h"
+ #include "ItemCountValue.h"
+ #include "ItemPackets.h"
+@@ -112,6 +113,10 @@
+     ItemTemplate const* itemProto = item->GetTemplate();
+     uint32 itemId = itemProto->ItemId;
+     uint8 invType = itemProto->InventoryType;
++    uint32 const itemLevelCap = Playerbots::RandomBotItemLevelCap(bot);
++    if (itemLevelCap && itemProto->Class != ITEM_CLASS_CONTAINER && itemProto->Class != ITEM_CLASS_PROJECTILE &&
++        itemProto->ItemLevel > itemLevelCap)
++        return;
+ 
+     // Handle ammunition separately
+     if (invType == INVTYPE_AMMO)
+--- /dev/null
++++ b/src/Bot/Factory/RandomBotGearCap.h
+@@ -0,0 +1,31 @@
++#ifndef PLAYERBOTS_RANDOM_BOT_GEAR_CAP_H
++#define PLAYERBOTS_RANDOM_BOT_GEAR_CAP_H
++
++#include "Config.h"
++#include "Player.h"
++#include "PlayerbotAIConfig.h"
++#include "RandomBotGearProgression.h"
++#include "WorldSession.h"
++#include <algorithm>
++
++namespace Playerbots
++{
++inline uint32 RandomBotItemLevelCap(Player* bot)
++{
++    if (!bot || !bot->GetSession() ||
++        !sPlayerbotAIConfig.IsInRandomAccountList(bot->GetSession()->GetAccountId()))
++        return 0;
++
++    uint32 cap = sPlayerbotAIConfig.randomGearScoreLimit > 0
++        ? uint32(sPlayerbotAIConfig.randomGearScoreLimit) : 0;
++    static bool const progression = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaGearProgression", false);
++    if (progression)
++    {
++        uint32 const progressionCap = ProgressionItemLevelCap(bot->GetLevel(), bot->GetGUID().GetCounter());
++        cap = cap ? std::min(cap, progressionCap) : progressionCap;
++    }
++    return cap;
++}
++}
++
++#endif
+--- /dev/null
++++ b/src/Bot/Factory/RandomBotGearProgression.h
+@@ -0,0 +1,22 @@
++#ifndef PLAYERBOTS_RANDOM_BOT_GEAR_PROGRESSION_H
++#define PLAYERBOTS_RANDOM_BOT_GEAR_PROGRESSION_H
++
++#include <cstdint>
++
++namespace Playerbots
++{
++inline uint32_t ProgressionItemLevelCap(uint32_t level, uint32_t guid)
++{
++    if (level < 60)
++        return level + 10;
++    if (level < 70)
++        return 115 + (level - 60) * 3;
++    if (level < 80)
++        return 164 + (level - 70) * 4;
++
++    uint32_t const cohort = (guid * 2654435761u) % 100;
++    return cohort < 40 ? 200 : cohort < 70 ? 232 : cohort < 90 ? 251 : cohort < 95 ? 264 : 284;
++}
++}
++
++#endif
+--- /dev/null
++++ b/tests/RandomBotGearProgressionTest.cpp
+@@ -0,0 +1,41 @@
++#include "RandomBotGearProgression.h"
++#include <gtest/gtest.h>
++#include <map>
++
++TEST(RandomBotGearProgression, LevelBoundaries)
++{
++    EXPECT_EQ(Playerbots::ProgressionItemLevelCap(1, 1), 11u);
++    EXPECT_EQ(Playerbots::ProgressionItemLevelCap(59, 1), 69u);
++    EXPECT_EQ(Playerbots::ProgressionItemLevelCap(60, 1), 115u);
++    EXPECT_EQ(Playerbots::ProgressionItemLevelCap(69, 1), 142u);
++    EXPECT_EQ(Playerbots::ProgressionItemLevelCap(70, 1), 164u);
++    EXPECT_EQ(Playerbots::ProgressionItemLevelCap(79, 1), 200u);
++}
++
++TEST(RandomBotGearProgression, TopGearRemainsRareAcrossGuids)
++{
++    std::map<uint32_t, uint32_t> counts;
++    for (uint32_t guid = 1; guid <= 10000; ++guid)
++    {
++        uint32_t const cap = Playerbots::ProgressionItemLevelCap(80, guid);
++        EXPECT_LE(cap, 284u);
++        ++counts[cap];
++    }
++    EXPECT_EQ(counts.size(), 5u);
++    EXPECT_GE(counts[284], 400u);
++    EXPECT_LE(counts[284], 600u);
++    EXPECT_GT(counts[200], counts[232]);
++    EXPECT_GT(counts[232], counts[251]);
++    EXPECT_GT(counts[251], counts[264]);
++}
++
++TEST(RandomBotGearProgression, CohortsStayStableWhileLeveling)
++{
++    for (uint32_t guid : {1u, 100u, 65535u, 4294967295u})
++    {
++        EXPECT_EQ(Playerbots::ProgressionItemLevelCap(80, guid), Playerbots::ProgressionItemLevelCap(81, guid));
++        for (uint32_t level = 1; level < 80; ++level)
++            EXPECT_LE(Playerbots::ProgressionItemLevelCap(level, guid),
++                Playerbots::ProgressionItemLevelCap(level + 1, guid));
++    }
++}
+--- /dev/null
++++ b/mod-playerbots.cmake
+@@ -0,0 +1,6 @@
++if(NOT MODULE_MOD-PLAYERBOTS STREQUAL "disabled")
++    set_property(GLOBAL APPEND PROPERTY ACORE_MODULE_TEST_INCLUDES
++        "${CMAKE_SOURCE_DIR}/modules/mod-playerbots/src/Bot/Factory")
++    set_property(GLOBAL APPEND PROPERTY ACORE_MODULE_TEST_SOURCES
++        "${CMAKE_SOURCE_DIR}/modules/mod-playerbots/tests/RandomBotGearProgressionTest.cpp")
++endif()
+--- a/conf/playerbots.conf.dist
++++ b/conf/playerbots.conf.dist
+@@ -3677,3 +3677,7 @@
+ 
+ # Allow bots to be summoned near innkeepers
+ AiPlayerbot.SummonAtInnkeepersEnabled = 1
++
++# Stable random-bot equipment tiers. Restart after changing this option.
++# Level 80: 40% cap 200, 30% 232, 20% 251, 5% 264, 5% 284.
++AiPlayerbot.CoaGearProgression = 0
